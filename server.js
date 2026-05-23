@@ -1,7 +1,6 @@
 import express from "express";
 import admin from "firebase-admin";
 import { google } from "googleapis";
-import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -20,10 +19,11 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || "";
 const CLEANSLATE_USER_ID = process.env.CLEANSLATE_USER_ID || "";
-const POLL_MS = Number(process.env.POLL_MS || 5000);
+
+const POLL_MS = Number(process.env.POLL_MS || 3000);
 const SCAN_PAGE_SIZE = Number(process.env.SCAN_PAGE_SIZE || 500);
-const SCAN_MESSAGE_CONCURRENCY = Number(process.env.SCAN_MESSAGE_CONCURRENCY || 12);
-const MAX_SCAN_PAGES_PER_CYCLE = Number(process.env.MAX_SCAN_PAGES_PER_CYCLE || 10);
+const SCAN_MESSAGE_CONCURRENCY = Number(process.env.SCAN_MESSAGE_CONCURRENCY || 25);
+const MAX_SCAN_PAGES_PER_CYCLE = Number(process.env.MAX_SCAN_PAGES_PER_CYCLE || 25);
 const MAX_JOBS_PER_CYCLE = Number(process.env.MAX_JOBS_PER_CYCLE || 10);
 const MAX_MESSAGES_PER_SENDER = Number(process.env.MAX_MESSAGES_PER_SENDER || 25000);
 
@@ -48,6 +48,24 @@ function hasFirebase() { return admin.apps.length > 0; }
 function hasGoogleOAuth() { return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_REFRESH_TOKEN); }
 function hasUser() { return Boolean(CLEANSLATE_USER_ID); }
 function db() { return admin.firestore(); }
+
+function stateRef() {
+  return db().collection("users").doc(CLEANSLATE_USER_ID).collection("state").doc("scan");
+}
+
+async function saveScanState(patch) {
+  await stateRef().set({ ...patch, updatedAt: new Date().toISOString() }, { merge: true });
+}
+
+async function loadScanState() {
+  const snap = await stateRef().get();
+  if (!snap.exists) {
+    const initial = { total: 0, pages: 0, nextPageToken: "", running: false, done: false, lastError: "" };
+    await saveScanState(initial);
+    return initial;
+  }
+  return snap.data() || {};
+}
 
 function assertReady() {
   if (!hasFirebase()) throw new Error("Firebase Admin is not initialized.");
@@ -116,114 +134,130 @@ async function mapConcurrent(items, limit, fn) {
   let index = 0;
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
     while (index < items.length) {
-      const item = items[index++];
-      await fn(item);
+      const i = index++;
+      await fn(items[i], i);
     }
   });
   await Promise.all(workers);
 }
 
-async function saveScanState(state) {
-  await db().collection("users").doc(CLEANSLATE_USER_ID).collection("state").doc("scan").set({
-    ...state,
-    updatedAt: new Date().toISOString()
-  }, { merge: true });
+function mergeSender(map, sender) {
+  const existing = map.get(sender.key) || { ...sender, count: 0 };
+  existing.count += sender.count || 1;
+  existing.name = sender.name || existing.name;
+  existing.email = sender.email || existing.email;
+  existing.domain = sender.domain || existing.domain;
+  existing.unsubUrl = existing.unsubUrl || sender.unsubUrl || "";
+  existing.unsubMailto = existing.unsubMailto || sender.unsubMailto || "";
+  existing.oneClick = existing.oneClick || sender.oneClick || false;
+  existing.bucket = classifySender(existing);
+  map.set(sender.key, existing);
 }
 
-async function loadScanState() {
-  const ref = db().collection("users").doc(CLEANSLATE_USER_ID).collection("state").doc("scan");
-  const snap = await ref.get();
-  if (!snap.exists) {
-    const initial = { total: 0, pages: 0, nextPageToken: "", running: false, done: false };
-    await ref.set({ ...initial, updatedAt: new Date().toISOString() }, { merge: true });
-    return initial;
+async function batchUpsertSenders(senderMap) {
+  const entries = [...senderMap.values()];
+  for (let i = 0; i < entries.length; i += 400) {
+    const batch = db().batch();
+    entries.slice(i, i + 400).forEach((sender) => {
+      const ref = db().collection("users").doc(CLEANSLATE_USER_ID).collection("senders").doc(sender.key);
+      batch.set(ref, { ...sender, updatedAt: new Date().toISOString() }, { merge: true });
+    });
+    await batch.commit();
   }
-  return snap.data() || {};
 }
 
-async function upsertSender(sender) {
-  const key = sender.key;
-  const ref = db().collection("users").doc(CLEANSLATE_USER_ID).collection("senders").doc(key);
-  await db().runTransaction(async tx => {
-    const snap = await tx.get(ref);
-    const old = snap.exists ? snap.data() : {};
-    const merged = {
-      ...old,
-      ...sender,
-      count: Number(old.count || 0) + Number(sender.count || 1),
-      bucket: old.protected ? "safe" : classifySender({ ...old, ...sender }),
-      updatedAt: new Date().toISOString()
-    };
-    tx.set(ref, merged, { merge: true });
+async function processOneScanPage(gmail, state) {
+  const list = await gmail.users.messages.list({
+    userId: "me",
+    maxResults: SCAN_PAGE_SIZE,
+    pageToken: state.nextPageToken || undefined
   });
+
+  const messages = list.data.messages || [];
+  if (!messages.length) {
+    await saveScanState({ running: false, done: true, lastError: "" });
+    return { scanned: 0, done: true };
+  }
+
+  const senderMap = new Map();
+  let completed = 0;
+
+  await mapConcurrent(messages, SCAN_MESSAGE_CONCURRENCY, async (m) => {
+    try {
+      const msg = await gmail.users.messages.get({
+        userId: "me",
+        id: m.id,
+        format: "metadata",
+        metadataHeaders: ["From", "List-Unsubscribe", "List-Unsubscribe-Post"]
+      });
+
+      const headers = msg.data.payload?.headers || [];
+      const from = header(headers, "From");
+      if (!from) return;
+
+      const parsed = parseFrom(from);
+      const domain = domainOf(parsed.email || parsed.name);
+      const unsub = extractUnsubscribe(headers);
+      const key = cleanKey(parsed.email || domain || parsed.name);
+
+      mergeSender(senderMap, {
+        key,
+        name: parsed.name,
+        email: parsed.email,
+        domain,
+        count: 1,
+        ...unsub
+      });
+    } catch (error) {
+      console.error("Message scan failed:", error.message || error);
+    } finally {
+      completed++;
+      if (completed % 100 === 0) {
+        await saveScanState({ livePageProgress: completed, running: true, lastError: "" });
+      }
+    }
+  });
+
+  await batchUpsertSenders(senderMap);
+
+  const newTotal = Number(state.total || 0) + messages.length;
+  const newPages = Number(state.pages || 0) + 1;
+  const nextPageToken = list.data.nextPageToken || "";
+  const done = !nextPageToken;
+
+  await saveScanState({
+    total: newTotal,
+    pages: newPages,
+    nextPageToken,
+    running: !done,
+    done,
+    livePageProgress: 0,
+    lastPageScanned: messages.length,
+    lastSenderGroupsWritten: senderMap.size,
+    lastError: ""
+  });
+
+  return { scanned: messages.length, senderGroups: senderMap.size, done };
 }
 
 async function processScanCycle() {
   assertReady();
-  let state = await loadScanState();
-  if (!state.running || state.done) return { scanned: 0, reason: "not_running" };
-
   const gmail = await gmailClient();
-  let scanned = 0;
+  let totalScanned = 0;
+  let totalGroups = 0;
 
-  for (let pageNum = 0; pageNum < MAX_SCAN_PAGES_PER_CYCLE; pageNum++) {
-    state = await loadScanState();
-    if (!state.running || state.done) break;
+  for (let page = 0; page < MAX_SCAN_PAGES_PER_CYCLE; page++) {
+    const state = await loadScanState();
+    if (!state.running || state.done) return { scanned: totalScanned, senderGroups: totalGroups, reason: "not_running_or_done" };
 
-    const list = await gmail.users.messages.list({
-      userId: "me",
-      maxResults: SCAN_PAGE_SIZE,
-      pageToken: state.nextPageToken || undefined
-    });
+    const result = await processOneScanPage(gmail, state);
+    totalScanned += result.scanned || 0;
+    totalGroups += result.senderGroups || 0;
 
-    const messages = list.data.messages || [];
-    if (!messages.length) {
-      state.done = true;
-      state.running = false;
-      await saveScanState(state);
-      break;
-    }
-
-    await mapConcurrent(messages, SCAN_MESSAGE_CONCURRENCY, async (m) => {
-      try {
-        const msg = await gmail.users.messages.get({
-          userId: "me",
-          id: m.id,
-          format: "metadata",
-          metadataHeaders: ["From", "List-Unsubscribe", "List-Unsubscribe-Post"]
-        });
-        const headers = msg.data.payload?.headers || [];
-        const from = header(headers, "From");
-        if (!from) return;
-        const parsed = parseFrom(from);
-        const domain = domainOf(parsed.email || parsed.name);
-        const unsub = extractUnsubscribe(headers);
-        const key = cleanKey(parsed.email || domain || parsed.name);
-        await upsertSender({
-          key,
-          name: parsed.name,
-          email: parsed.email,
-          domain,
-          count: 1,
-          ...unsub
-        });
-      } catch (error) {
-        console.error("Message scan failed:", error.message || error);
-      }
-    });
-
-    scanned += messages.length;
-    state.total = Number(state.total || 0) + messages.length;
-    state.pages = Number(state.pages || 0) + 1;
-    state.nextPageToken = list.data.nextPageToken || "";
-    state.running = true;
-    state.done = !state.nextPageToken;
-    if (state.done) state.running = false;
-    await saveScanState(state);
-    if (!state.nextPageToken) break;
+    if (result.done || !result.scanned) break;
   }
 
-  return { scanned, state };
+  return { scanned: totalScanned, senderGroups: totalGroups };
 }
 
 function senderQuery(job) {
@@ -292,12 +326,6 @@ async function processCleanupQueueOnce() {
       updatedAt: new Date().toISOString()
     }, { merge: true });
 
-    await db().collection("users").doc(CLEANSLATE_USER_ID).collection("cleanupHistory").doc(docSnap.id).set({
-      ...job,
-      deleteCount: ids.length,
-      processedAt: new Date().toISOString()
-    }, { merge: true });
-
     processed++;
   }
 
@@ -315,6 +343,7 @@ function healthPayload() {
     scanActive,
     cleanupActive,
     pollMs: POLL_MS,
+    scanPageSize: SCAN_PAGE_SIZE,
     maxScanPagesPerCycle: MAX_SCAN_PAGES_PER_CYCLE,
     scanMessageConcurrency: SCAN_MESSAGE_CONCURRENCY
   };
@@ -327,10 +356,25 @@ app.post("/scan/start", async (req, res) => {
   try {
     assertReady();
     const state = await loadScanState();
-    await saveScanState({ ...state, running: true, done: false });
-    if (!scanActive) runScanLoop();
-    res.json({ ok: true, message: "scan_started" });
+    const patch = {
+      running: true,
+      done: false,
+      lastError: "",
+      startedAt: state.startedAt || new Date().toISOString()
+    };
+
+    if (req.body?.restart === true) {
+      patch.total = 0;
+      patch.pages = 0;
+      patch.nextPageToken = "";
+      patch.startedAt = new Date().toISOString();
+    }
+
+    await saveScanState(patch);
+    runScanLoop();
+    res.json({ ok: true, message: "scan_started", currentTotal: state.total || 0 });
   } catch (error) {
+    try { await saveScanState({ lastError: error.message || String(error), running: false }); } catch {}
     res.status(500).json({ ok: false, error: error.message || String(error) });
   }
 });
@@ -338,8 +382,7 @@ app.post("/scan/start", async (req, res) => {
 app.post("/scan/pause", async (req, res) => {
   try {
     assertReady();
-    const state = await loadScanState();
-    await saveScanState({ ...state, running: false });
+    await saveScanState({ running: false });
     res.json({ ok: true, message: "scan_pause_requested" });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || String(error) });
@@ -349,10 +392,28 @@ app.post("/scan/pause", async (req, res) => {
 app.post("/scan/reset", async (req, res) => {
   try {
     assertReady();
-    const state = { total: 0, pages: 0, nextPageToken: "", running: false, done: false };
-    await saveScanState(state);
+    await saveScanState({
+      total: 0,
+      pages: 0,
+      nextPageToken: "",
+      running: false,
+      done: false,
+      livePageProgress: 0,
+      lastError: "",
+      startedAt: new Date().toISOString()
+    });
     res.json({ ok: true, message: "scan_reset" });
   } catch (error) {
+    res.status(500).json({ ok: false, error: error.message || String(error) });
+  }
+});
+
+app.post("/scan/tick", async (req, res) => {
+  try {
+    const result = await processScanCycle();
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    try { await saveScanState({ lastError: error.message || String(error), running: false }); } catch {}
     res.status(500).json({ ok: false, error: error.message || String(error) });
   }
 });
@@ -374,11 +435,12 @@ async function runScanLoop() {
       const state = await loadScanState();
       if (!state.running || state.done) break;
       const result = await processScanCycle();
-      console.log("Scan cycle:", result.scanned);
+      console.log("Scan cycle:", result);
       if (!result.scanned) break;
     }
   } catch (error) {
     console.error("Scan loop error:", error.message || error);
+    try { await saveScanState({ lastError: error.message || String(error), running: false }); } catch {}
   } finally {
     scanActive = false;
   }
@@ -398,7 +460,7 @@ async function runCleanupLoop() {
 }
 
 app.listen(PORT, () => {
-  console.log(`CleanSlate server-side worker listening on ${PORT}`);
+  console.log(`CleanSlate FAST worker listening on ${PORT}`);
 });
 
 setInterval(async () => {
@@ -409,5 +471,6 @@ setInterval(async () => {
     runCleanupLoop();
   } catch (error) {
     console.error("Background interval error:", error.message || error);
+    try { await saveScanState({ lastError: error.message || String(error), running: false }); } catch {}
   }
 }, POLL_MS);

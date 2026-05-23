@@ -1,6 +1,6 @@
 {
   "name": "cleanslate-render-worker",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,8 +9,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "firebase-admin": "^12.5.0",
-    "googleapis": "^140.0.1",
-    "node-fetch": "^3.3.2"
+    "googleapis": "^140.0.1"
   },
   "engines": {
     "node": ">=20"
