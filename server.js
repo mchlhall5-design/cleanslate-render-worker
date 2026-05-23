@@ -19,16 +19,19 @@ const GOOGLE_CLIENT_SECRET=process.env.GOOGLE_CLIENT_SECRET||"";
 const CLEANSLATE_USER_ID=process.env.CLEANSLATE_USER_ID||"";
 const WORKER_URL=(process.env.WORKER_URL||"https://cleanslate-render-worker.onrender.com").replace(/\/$/,"");
 
-const POLL_MS=Number(process.env.POLL_MS||3000);
-const SCAN_PAGE_SIZE=Number(process.env.SCAN_PAGE_SIZE||500);
-const SCAN_MESSAGE_CONCURRENCY=Number(process.env.SCAN_MESSAGE_CONCURRENCY||8);
-const MAX_SCAN_PAGES_PER_CYCLE=Number(process.env.MAX_SCAN_PAGES_PER_CYCLE||3);
-const MESSAGE_DELAY_MS=Number(process.env.MESSAGE_DELAY_MS||120);
-const RATE_LIMIT_BACKOFF_MS=Number(process.env.RATE_LIMIT_BACKOFF_MS||70000);
-const MAX_JOBS_PER_CYCLE=Number(process.env.MAX_JOBS_PER_CYCLE||5);
-const MAX_MESSAGES_PER_SENDER=Number(process.env.MAX_MESSAGES_PER_SENDER||25000);
+const SPEEDS = {
+  safe: { concurrency: 8, maxPagesPerCycle: 3, messageDelayMs: 120, backoffMs: 70000 },
+  fast: { concurrency: 12, maxPagesPerCycle: 5, messageDelayMs: 80, backoffMs: 60000 },
+  max: { concurrency: 20, maxPagesPerCycle: 8, messageDelayMs: 35, backoffMs: 90000 }
+};
+
+const POLL_MS=3000;
+const SCAN_PAGE_SIZE=500;
+const MAX_JOBS_PER_CYCLE=5;
+const MAX_MESSAGES_PER_SENDER=25000;
 
 let scanActive=false, cleanupActive=false;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
 if(!admin.apps.length){
   const raw=process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
@@ -42,7 +45,6 @@ if(!admin.apps.length){
   }
 }
 
-const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const hasFirebase=()=>admin.apps.length>0;
 const hasGoogleClient=()=>Boolean(GOOGLE_CLIENT_ID&&GOOGLE_CLIENT_SECRET);
 const hasUser=()=>Boolean(CLEANSLATE_USER_ID);
@@ -70,11 +72,17 @@ async function saveScanState(patch){
 async function loadScanState(){
   const s=await stateRef().get();
   if(!s.exists){
-    const i={total:0,pages:0,nextPageToken:"",running:false,done:false,lastError:""};
+    const i={total:0,pages:0,nextPageToken:"",running:false,done:false,lastError:"",speedMode:"fast"};
     await saveScanState(i);
     return i;
   }
   return s.data()||{};
+}
+
+async function getSpeed(){
+  const s=await loadScanState();
+  const mode = SPEEDS[s.speedMode] ? s.speedMode : "fast";
+  return { mode, ...SPEEDS[mode] };
 }
 
 function assertReadyForFirebase(){
@@ -98,6 +106,22 @@ async function gmailClient(){
   return google.gmail({version:"v1",auth:oauthClient(await getStoredRefreshToken())});
 }
 
+async function gmailCall(fn,label){
+  while(true){
+    try{return await fn();}
+    catch(e){
+      if(isRateLimit(e)){
+        const sp=await getSpeed();
+        const msg=`Rate limit hit at ${label}. Waiting ${Math.round(sp.backoffMs/1000)} seconds, then continuing automatically.`;
+        await saveScanState({lastError:msg,running:true,rateLimitedAt:new Date().toISOString()}).catch(()=>{});
+        await sleep(sp.backoffMs);
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 const header=(hs,n)=>(hs||[]).find(h=>(h.name||"").toLowerCase()===n.toLowerCase())?.value||"";
 
 function parseFrom(v){
@@ -106,6 +130,7 @@ function parseFrom(v){
   const email=(input.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)||[""])[0].toLowerCase();
   return {name:email?email.split("@")[0]:input||"Unknown",email:email||input.toLowerCase()};
 }
+
 const domainOf=e=>String(e||"").split("@").pop().toLowerCase().replace(/^www\./,"");
 const cleanKey=v=>String(v||"unknown").toLowerCase().replace(/[.#$/\[\]]/g,"_").slice(0,180);
 
@@ -153,28 +178,21 @@ async function batchUpsertSenders(map){
   }
 }
 
-async function gmailCall(fn, label){
-  while(true){
-    try {
-      return await fn();
-    } catch(e) {
-      if(isRateLimit(e)){
-        const msg=`Rate limit hit at ${label}. Waiting ${Math.round(RATE_LIMIT_BACKOFF_MS/1000)} seconds, then continuing automatically.`;
-        console.warn(msg);
-        await saveScanState({lastError:msg,running:true,rateLimitedAt:new Date().toISOString()}).catch(()=>{});
-        await sleep(RATE_LIMIT_BACKOFF_MS);
-        continue;
-      }
-      throw e;
+async function updateProfileEstimate(gmail){
+  try{
+    const profile=await gmail.users.getProfile({userId:"me"});
+    const messagesTotal=Number(profile.data.messagesTotal||0);
+    if(messagesTotal){
+      await saveScanState({messagesTotal,estimatedTotal:messagesTotal});
     }
-  }
+  }catch(e){console.warn("profile estimate failed",e.message||e);}
 }
 
 async function processOneScanPage(gmail,state){
+  const sp=await getSpeed();
+  const started=Date.now();
   const list=await gmailCall(()=>gmail.users.messages.list({
-    userId:"me",
-    maxResults:SCAN_PAGE_SIZE,
-    pageToken:state.nextPageToken||undefined
+    userId:"me",maxResults:SCAN_PAGE_SIZE,pageToken:state.nextPageToken||undefined
   }),"message list");
 
   const messages=list.data.messages||[];
@@ -183,59 +201,71 @@ async function processOneScanPage(gmail,state){
     return {scanned:0,done:true};
   }
 
-  const map=new Map();
-  let completed=0;
+  const senderMap=new Map();
+  let cursor=0, processed=0;
 
-  const worker = async () => {
-    while(messages.length){
-      const m=messages.shift();
-      await sleep(MESSAGE_DELAY_MS);
+  async function worker(){
+    while(cursor<messages.length){
+      const m=messages[cursor++];
+      await sleep(sp.messageDelayMs);
       try{
-        const msg=await gmailCall(()=>gmail.users.messages.get({
+        const full=await gmailCall(()=>gmail.users.messages.get({
           userId:"me",
           id:m.id,
           format:"metadata",
           metadataHeaders:["From","List-Unsubscribe","List-Unsubscribe-Post"]
         }),"message metadata");
 
-        const hs=msg.data.payload?.headers||[];
+        const hs=full.data.payload?.headers||[];
         const from=header(hs,"From");
         if(from){
           const p=parseFrom(from),domain=domainOf(p.email||p.name),unsub=extractUnsubscribe(hs),key=cleanKey(p.email||domain||p.name);
-          mergeSender(map,{key,name:p.name,email:p.email,domain,count:1,...unsub});
+          mergeSender(senderMap,{key,name:p.name,email:p.email,domain,count:1,...unsub});
         }
       }catch(e){
         if(isRateLimit(e)) throw e;
         console.error("Message scan failed:",e.message||e);
       }finally{
-        completed++;
-        if(completed%50===0) await saveScanState({livePageProgress:completed,running:true,lastError:""}).catch(()=>{});
+        processed++;
+        if(processed%50===0){
+          await saveScanState({running:true,livePageProgress:processed,lastError:""}).catch(()=>{});
+        }
       }
     }
-  };
+  }
 
-  await Promise.all(Array.from({length:SCAN_MESSAGE_CONCURRENCY},worker));
-  await batchUpsertSenders(map);
+  await Promise.all(Array.from({length:sp.concurrency},()=>worker()));
+  await batchUpsertSenders(senderMap);
 
-  const total=Number(state.total||0)+completed;
+  const total=Number(state.total||0)+processed;
   const pages=Number(state.pages||0)+1;
   const nextPageToken=list.data.nextPageToken||"";
   const done=!nextPageToken;
+  const estimatedTotal=Number(state.estimatedTotal||state.messagesTotal||0);
+  const elapsedSec=Math.max(1,(Date.now()-started)/1000);
+  const emailsPerMinute=Math.round((processed/elapsedSec)*60);
+  const etaSeconds=estimatedTotal && emailsPerMinute ? Math.max(0,Math.round(((estimatedTotal-total)/emailsPerMinute)*60)) : null;
+  const percentComplete=estimatedTotal ? Math.min(100,Math.round((total/estimatedTotal)*1000)/10) : null;
 
   await saveScanState({
     total,pages,nextPageToken,running:!done,done,livePageProgress:0,
-    lastPageScanned:completed,lastSenderGroupsWritten:map.size,lastError:""
+    lastPageScanned:processed,lastSenderGroupsWritten:senderMap.size,lastError:"",
+    emailsPerMinute,etaSeconds,percentComplete,
+    speedMode:sp.mode,
+    estimatedTotal: estimatedTotal || null
   });
 
-  return {scanned:completed,senderGroups:map.size,done};
+  return {scanned:processed,senderGroups:senderMap.size,done};
 }
 
 async function processScanCycle(){
   await assertReadyForGmail();
   const gmail=await gmailClient();
+  await updateProfileEstimate(gmail);
+  const sp=await getSpeed();
   let scanned=0,groups=0;
 
-  for(let p=0;p<MAX_SCAN_PAGES_PER_CYCLE;p++){
+  for(let p=0;p<sp.maxPagesPerCycle;p++){
     const s=await loadScanState();
     if(!s.running||s.done) return {scanned,senderGroups:groups,reason:"not_running_or_done"};
     const r=await processOneScanPage(gmail,s);
@@ -284,6 +314,7 @@ async function processCleanupQueueOnce(){
     const ids=await listAllMessageIds(gmail,query);
     if(ids.length) await batchModify(gmail,ids,["TRASH"],[]);
     await d.ref.set({status:"complete",workerStatus:"complete",deleteCount:ids.length,updatedAt:new Date().toISOString()},{merge:true});
+    await userDoc().collection("cleanupHistory").doc(d.id).set({...job,deleteCount:ids.length,processedAt:new Date().toISOString()},{merge:true});
     processed++;
   }
   return {processed,skippedSafe};
@@ -292,18 +323,27 @@ async function processCleanupQueueOnce(){
 async function healthPayload(){
   let hasStoredGmailToken=false;
   try{hasStoredGmailToken=Boolean(await getStoredRefreshToken());}catch{}
+  const sp = await getSpeed().catch(()=>({mode:"fast"}));
   return {
-    ok:true,service:"CleanSlate Auto Continue Worker",projectId:PROJECT_ID,
+    ok:true,service:"CleanSlate Speed Percent Worker",projectId:PROJECT_ID,
     hasFirebase:hasFirebase(),hasGoogleClient:hasGoogleClient(),hasStoredGmailToken,hasUser:hasUser(),
     scanActive,cleanupActive,pollMs:POLL_MS,scanPageSize:SCAN_PAGE_SIZE,
-    maxScanPagesPerCycle:MAX_SCAN_PAGES_PER_CYCLE,scanMessageConcurrency:SCAN_MESSAGE_CONCURRENCY,
-    messageDelayMs:MESSAGE_DELAY_MS,rateLimitBackoffMs:RATE_LIMIT_BACKOFF_MS,
+    speedMode:sp.mode, speedSettings:sp,
     oauthCallback:`${WORKER_URL}/oauth/callback`
   };
 }
 
 app.get("/",async(req,res)=>res.json(await healthPayload()));
 app.get("/status",async(req,res)=>res.json(await healthPayload()));
+
+app.post("/scan/speed",async(req,res)=>{
+  try{
+    assertReadyForFirebase();
+    const mode = SPEEDS[req.body?.mode] ? req.body.mode : "fast";
+    await saveScanState({speedMode:mode,lastError:`Speed changed to ${mode}.`});
+    res.json({ok:true,speedMode:mode,settings:SPEEDS[mode]});
+  }catch(e){res.status(500).json({ok:false,error:e.message||String(e)});}
+});
 
 app.get("/oauth/start",async(req,res)=>{
   try{
@@ -347,7 +387,7 @@ app.post("/scan/start",async(req,res)=>{
     if(req.body?.restart===true){ patch.total=0; patch.pages=0; patch.nextPageToken=""; patch.startedAt=new Date().toISOString(); }
     await saveScanState(patch);
     runScanLoop();
-    res.json({ok:true,message:"scan_started_auto_continue",currentTotal:s.total||0});
+    res.json({ok:true,message:"scan_started",currentTotal:s.total||0});
   }catch(e){
     await saveScanState({lastError:e.message||String(e),running:false}).catch(()=>{});
     res.status(500).json({ok:false,error:e.message||String(e)});
@@ -362,7 +402,7 @@ app.post("/scan/pause",async(req,res)=>{
 app.post("/scan/reset",async(req,res)=>{
   try{
     assertReadyForFirebase();
-    await saveScanState({total:0,pages:0,nextPageToken:"",running:false,done:false,livePageProgress:0,lastError:"",startedAt:new Date().toISOString()});
+    await saveScanState({total:0,pages:0,nextPageToken:"",running:false,done:false,livePageProgress:0,lastError:"",startedAt:new Date().toISOString(),speedMode:"fast"});
     res.json({ok:true,message:"scan_reset"});
   }catch(e){res.status(500).json({ok:false,error:e.message||String(e)});}
 });
@@ -381,14 +421,13 @@ async function runScanLoop(){
       if(!s.running||s.done) break;
       const r=await processScanCycle();
       console.log("Scan cycle:",r);
-      if(!r.scanned){
-        await sleep(10000);
-      }
+      if(!r.scanned) await sleep(10000);
     }
   }catch(e){
     if(isRateLimit(e)){
-      await saveScanState({lastError:`Rate limit hit. Waiting ${Math.round(RATE_LIMIT_BACKOFF_MS/1000)} seconds, then continuing automatically.`,running:true}).catch(()=>{});
-      await sleep(RATE_LIMIT_BACKOFF_MS);
+      const sp=await getSpeed();
+      await saveScanState({lastError:`Rate limit hit. Waiting ${Math.round(sp.backoffMs/1000)} seconds, then continuing automatically.`,running:true}).catch(()=>{});
+      await sleep(sp.backoffMs);
       scanActive=false;
       return runScanLoop();
     }
@@ -407,7 +446,7 @@ async function runCleanupLoop(){
   finally{cleanupActive=false;}
 }
 
-app.listen(PORT,()=>console.log(`CleanSlate auto-continue worker listening on ${PORT}`));
+app.listen(PORT,()=>console.log(`CleanSlate speed-percent worker listening on ${PORT}`));
 
 setInterval(async()=>{
   try{
