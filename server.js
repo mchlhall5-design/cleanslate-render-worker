@@ -20,9 +20,9 @@ const CLEANSLATE_USER_ID=process.env.CLEANSLATE_USER_ID||"";
 const WORKER_URL=(process.env.WORKER_URL||"https://cleanslate-render-worker.onrender.com").replace(/\/$/,"");
 
 const SPEEDS = {
-  safe: { concurrency: 8, maxPagesPerCycle: 3, messageDelayMs: 120, backoffMs: 70000 },
-  fast: { concurrency: 12, maxPagesPerCycle: 5, messageDelayMs: 80, backoffMs: 60000 },
-  max: { concurrency: 20, maxPagesPerCycle: 8, messageDelayMs: 35, backoffMs: 90000 }
+  safe: { concurrency: 12, maxPagesPerCycle: 5, messageDelayMs: 80, backoffMs: 60000 },
+  fast: { concurrency: 24, maxPagesPerCycle: 8, messageDelayMs: 25, backoffMs: 75000 },
+  max: { concurrency: 45, maxPagesPerCycle: 12, messageDelayMs: 0, backoffMs: 90000 }
 };
 
 const POLL_MS=3000;
@@ -325,7 +325,7 @@ async function healthPayload(){
   try{hasStoredGmailToken=Boolean(await getStoredRefreshToken());}catch{}
   const sp = await getSpeed().catch(()=>({mode:"fast"}));
   return {
-    ok:true,service:"CleanSlate Speed Percent Worker",projectId:PROJECT_ID,
+    ok:true,service:"CleanSlate Scroll Fixed Max Speed Worker",projectId:PROJECT_ID,
     hasFirebase:hasFirebase(),hasGoogleClient:hasGoogleClient(),hasStoredGmailToken,hasUser:hasUser(),
     scanActive,cleanupActive,pollMs:POLL_MS,scanPageSize:SCAN_PAGE_SIZE,
     speedMode:sp.mode, speedSettings:sp,
