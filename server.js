@@ -4,473 +4,51 @@ import { google } from "googleapis";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
+app.use((req,res,next)=>{res.setHeader("Access-Control-Allow-Origin","*");res.setHeader("Access-Control-Allow-Headers","Content-Type, Authorization");res.setHeader("Access-Control-Allow-Methods","GET, POST, OPTIONS");if(req.method==="OPTIONS")return res.sendStatus(204);next();});
 
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
+const PORT=process.env.PORT||10000;
+const PROJECT_ID=process.env.FIREBASE_PROJECT_ID||"cleanslate-c9be5";
+const GOOGLE_CLIENT_ID=process.env.GOOGLE_CLIENT_ID||"";
+const GOOGLE_CLIENT_SECRET=process.env.GOOGLE_CLIENT_SECRET||"";
+const CLEANSLATE_USER_ID=process.env.CLEANSLATE_USER_ID||"";
+const WORKER_URL=(process.env.WORKER_URL||"https://cleanslate-render-worker.onrender.com").replace(/\/$/,"");
+const POLL_MS=Number(process.env.POLL_MS||3000), SCAN_PAGE_SIZE=Number(process.env.SCAN_PAGE_SIZE||500), SCAN_MESSAGE_CONCURRENCY=Number(process.env.SCAN_MESSAGE_CONCURRENCY||25), MAX_SCAN_PAGES_PER_CYCLE=Number(process.env.MAX_SCAN_PAGES_PER_CYCLE||25), MAX_JOBS_PER_CYCLE=Number(process.env.MAX_JOBS_PER_CYCLE||10), MAX_MESSAGES_PER_SENDER=Number(process.env.MAX_MESSAGES_PER_SENDER||25000);
+let scanActive=false, cleanupActive=false;
 
-const PORT = process.env.PORT || 10000;
-const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "cleanslate-c9be5";
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
-const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || "";
-const CLEANSLATE_USER_ID = process.env.CLEANSLATE_USER_ID || "";
-
-const POLL_MS = Number(process.env.POLL_MS || 3000);
-const SCAN_PAGE_SIZE = Number(process.env.SCAN_PAGE_SIZE || 500);
-const SCAN_MESSAGE_CONCURRENCY = Number(process.env.SCAN_MESSAGE_CONCURRENCY || 25);
-const MAX_SCAN_PAGES_PER_CYCLE = Number(process.env.MAX_SCAN_PAGES_PER_CYCLE || 25);
-const MAX_JOBS_PER_CYCLE = Number(process.env.MAX_JOBS_PER_CYCLE || 10);
-const MAX_MESSAGES_PER_SENDER = Number(process.env.MAX_MESSAGES_PER_SENDER || 25000);
-
-let scanActive = false;
-let cleanupActive = false;
-
-if (!admin.apps.length) {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (!raw) console.error("Missing FIREBASE_SERVICE_ACCOUNT_JSON");
-  else {
-    try {
-      const serviceAccount = JSON.parse(raw);
-      admin.initializeApp({ credential: admin.credential.cert(serviceAccount), projectId: PROJECT_ID });
-      console.log("Firebase Admin initialized");
-    } catch (error) {
-      console.error("Firebase Admin initialization failed:", error.message || error);
-    }
-  }
-}
-
-function hasFirebase() { return admin.apps.length > 0; }
-function hasGoogleOAuth() { return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_REFRESH_TOKEN); }
-function hasUser() { return Boolean(CLEANSLATE_USER_ID); }
-function db() { return admin.firestore(); }
-
-function stateRef() {
-  return db().collection("users").doc(CLEANSLATE_USER_ID).collection("state").doc("scan");
-}
-
-async function saveScanState(patch) {
-  await stateRef().set({ ...patch, updatedAt: new Date().toISOString() }, { merge: true });
-}
-
-async function loadScanState() {
-  const snap = await stateRef().get();
-  if (!snap.exists) {
-    const initial = { total: 0, pages: 0, nextPageToken: "", running: false, done: false, lastError: "" };
-    await saveScanState(initial);
-    return initial;
-  }
-  return snap.data() || {};
-}
-
-function assertReady() {
-  if (!hasFirebase()) throw new Error("Firebase Admin is not initialized.");
-  if (!hasGoogleOAuth()) throw new Error("Missing Google OAuth variables.");
-  if (!hasUser()) throw new Error("Missing CLEANSLATE_USER_ID.");
-}
-
-function oauthClient() {
-  const client = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
-  client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
-  return client;
-}
-
-async function gmailClient() {
-  return google.gmail({ version: "v1", auth: oauthClient() });
-}
-
-function header(headers, name) {
-  return (headers || []).find(h => (h.name || "").toLowerCase() === name.toLowerCase())?.value || "";
-}
-
-function parseFrom(value) {
-  const input = value || "";
-  const match = input.match(/"?([^"<]+)"?\s*<([^>]+)>/);
-  if (match) return { name: match[1].trim().replace(/^"|"$/g, ""), email: match[2].trim().toLowerCase() };
-  const email = (input.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [""])[0].toLowerCase();
-  return { name: email ? email.split("@")[0] : input || "Unknown", email: email || input.toLowerCase() };
-}
-
-function domainOf(email) {
-  return String(email || "").split("@").pop().toLowerCase().replace(/^www\./, "");
-}
-
-function cleanKey(value) {
-  return String(value || "unknown").toLowerCase().replace(/[.#$/\[\]]/g, "_").slice(0, 180);
-}
-
-function extractUnsubscribe(headers) {
-  const raw = header(headers, "List-Unsubscribe");
-  const oneClick = Boolean(header(headers, "List-Unsubscribe-Post"));
-  const bracketUrls = [...String(raw || "").matchAll(/<([^>]+)>/g)].map(m => m[1]);
-  const splitUrls = String(raw || "").split(",").map(x => x.trim());
-  const urls = [...bracketUrls, ...splitUrls].filter(Boolean);
-  return {
-    unsubUrl: urls.find(u => /^https?:\/\//i.test(u) && !/example\.com/i.test(u)) || "",
-    unsubMailto: urls.find(u => /^mailto:/i.test(u)) || "",
-    oneClick
-  };
-}
-
-const protectedWords = [
-  "bank","credit","capital one","fidelity","mortgage","loan","insurance","geico","progressive",
-  "doctor","medical","hospital","mychart","pharmacy","irs","tax","payroll","w2","receipt",
-  "order","invoice","payment","statement","bill","utility","honda","acura","regal","google",
-  "apple","amazon","walmart","netflix","school","daycare","paypal","zelle","wallet"
-];
-
-function classifySender(sender) {
-  const text = `${sender.name} ${sender.email} ${sender.domain}`.toLowerCase();
-  if (protectedWords.some(word => text.includes(word))) return "safe";
-  if (sender.unsubUrl || sender.unsubMailto) return "cleanup";
-  return "review";
-}
-
-async function mapConcurrent(items, limit, fn) {
-  let index = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (index < items.length) {
-      const i = index++;
-      await fn(items[i], i);
-    }
-  });
-  await Promise.all(workers);
-}
-
-function mergeSender(map, sender) {
-  const existing = map.get(sender.key) || { ...sender, count: 0 };
-  existing.count += sender.count || 1;
-  existing.name = sender.name || existing.name;
-  existing.email = sender.email || existing.email;
-  existing.domain = sender.domain || existing.domain;
-  existing.unsubUrl = existing.unsubUrl || sender.unsubUrl || "";
-  existing.unsubMailto = existing.unsubMailto || sender.unsubMailto || "";
-  existing.oneClick = existing.oneClick || sender.oneClick || false;
-  existing.bucket = classifySender(existing);
-  map.set(sender.key, existing);
-}
-
-async function batchUpsertSenders(senderMap) {
-  const entries = [...senderMap.values()];
-  for (let i = 0; i < entries.length; i += 400) {
-    const batch = db().batch();
-    entries.slice(i, i + 400).forEach((sender) => {
-      const ref = db().collection("users").doc(CLEANSLATE_USER_ID).collection("senders").doc(sender.key);
-      batch.set(ref, { ...sender, updatedAt: new Date().toISOString() }, { merge: true });
-    });
-    await batch.commit();
-  }
-}
-
-async function processOneScanPage(gmail, state) {
-  const list = await gmail.users.messages.list({
-    userId: "me",
-    maxResults: SCAN_PAGE_SIZE,
-    pageToken: state.nextPageToken || undefined
-  });
-
-  const messages = list.data.messages || [];
-  if (!messages.length) {
-    await saveScanState({ running: false, done: true, lastError: "" });
-    return { scanned: 0, done: true };
-  }
-
-  const senderMap = new Map();
-  let completed = 0;
-
-  await mapConcurrent(messages, SCAN_MESSAGE_CONCURRENCY, async (m) => {
-    try {
-      const msg = await gmail.users.messages.get({
-        userId: "me",
-        id: m.id,
-        format: "metadata",
-        metadataHeaders: ["From", "List-Unsubscribe", "List-Unsubscribe-Post"]
-      });
-
-      const headers = msg.data.payload?.headers || [];
-      const from = header(headers, "From");
-      if (!from) return;
-
-      const parsed = parseFrom(from);
-      const domain = domainOf(parsed.email || parsed.name);
-      const unsub = extractUnsubscribe(headers);
-      const key = cleanKey(parsed.email || domain || parsed.name);
-
-      mergeSender(senderMap, {
-        key,
-        name: parsed.name,
-        email: parsed.email,
-        domain,
-        count: 1,
-        ...unsub
-      });
-    } catch (error) {
-      console.error("Message scan failed:", error.message || error);
-    } finally {
-      completed++;
-      if (completed % 100 === 0) {
-        await saveScanState({ livePageProgress: completed, running: true, lastError: "" });
-      }
-    }
-  });
-
-  await batchUpsertSenders(senderMap);
-
-  const newTotal = Number(state.total || 0) + messages.length;
-  const newPages = Number(state.pages || 0) + 1;
-  const nextPageToken = list.data.nextPageToken || "";
-  const done = !nextPageToken;
-
-  await saveScanState({
-    total: newTotal,
-    pages: newPages,
-    nextPageToken,
-    running: !done,
-    done,
-    livePageProgress: 0,
-    lastPageScanned: messages.length,
-    lastSenderGroupsWritten: senderMap.size,
-    lastError: ""
-  });
-
-  return { scanned: messages.length, senderGroups: senderMap.size, done };
-}
-
-async function processScanCycle() {
-  assertReady();
-  const gmail = await gmailClient();
-  let totalScanned = 0;
-  let totalGroups = 0;
-
-  for (let page = 0; page < MAX_SCAN_PAGES_PER_CYCLE; page++) {
-    const state = await loadScanState();
-    if (!state.running || state.done) return { scanned: totalScanned, senderGroups: totalGroups, reason: "not_running_or_done" };
-
-    const result = await processOneScanPage(gmail, state);
-    totalScanned += result.scanned || 0;
-    totalGroups += result.senderGroups || 0;
-
-    if (result.done || !result.scanned) break;
-  }
-
-  return { scanned: totalScanned, senderGroups: totalGroups };
-}
-
-function senderQuery(job) {
-  if (job.email) return `from:${job.email}`;
-  if (job.domain) return `from:${job.domain}`;
-  return "";
-}
-
-async function listAllMessageIds(gmail, q, limit = MAX_MESSAGES_PER_SENDER) {
-  const ids = [];
-  let pageToken = undefined;
-  while (ids.length < limit) {
-    const res = await gmail.users.messages.list({ userId: "me", maxResults: 500, q, pageToken });
-    for (const message of res.data.messages || []) {
-      ids.push(message.id);
-      if (ids.length >= limit) break;
-    }
-    pageToken = res.data.nextPageToken;
-    if (!pageToken) break;
-  }
-  return ids;
-}
-
-async function batchModify(gmail, ids, addLabelIds = [], removeLabelIds = []) {
-  for (let i = 0; i < ids.length; i += 1000) {
-    await gmail.users.messages.batchModify({
-      userId: "me",
-      requestBody: { ids: ids.slice(i, i + 1000), addLabelIds, removeLabelIds }
-    });
-  }
-}
-
-async function processCleanupQueueOnce() {
-  assertReady();
-  const gmail = await gmailClient();
-  const queue = await db()
-    .collection("users").doc(CLEANSLATE_USER_ID)
-    .collection("cleanupQueue")
-    .where("status", "in", ["queued", "retry"])
-    .limit(MAX_JOBS_PER_CYCLE)
-    .get();
-
-  let processed = 0;
-  let skippedSafe = 0;
-
-  for (const docSnap of queue.docs) {
-    const job = docSnap.data();
-    if (job.bucket === "safe" || job.protected) {
-      await docSnap.ref.set({ status: "skipped_safe", workerStatus: "skipped_safe", updatedAt: new Date().toISOString() }, { merge: true });
-      skippedSafe++;
-      continue;
-    }
-
-    const q = senderQuery(job);
-    if (!q) continue;
-
-    await docSnap.ref.set({ status: "processing", workerStatus: "processing", updatedAt: new Date().toISOString() }, { merge: true });
-
-    const ids = await listAllMessageIds(gmail, q);
-    if (ids.length) await batchModify(gmail, ids, ["TRASH"], []);
-
-    await docSnap.ref.set({
-      status: "complete",
-      workerStatus: "complete",
-      deleteCount: ids.length,
-      updatedAt: new Date().toISOString()
-    }, { merge: true });
-
-    processed++;
-  }
-
-  return { processed, skippedSafe };
-}
-
-function healthPayload() {
-  return {
-    ok: true,
-    service: "CleanSlate Render Worker",
-    projectId: PROJECT_ID,
-    hasFirebase: hasFirebase(),
-    hasGoogleOAuth: hasGoogleOAuth(),
-    hasUser: hasUser(),
-    scanActive,
-    cleanupActive,
-    pollMs: POLL_MS,
-    scanPageSize: SCAN_PAGE_SIZE,
-    maxScanPagesPerCycle: MAX_SCAN_PAGES_PER_CYCLE,
-    scanMessageConcurrency: SCAN_MESSAGE_CONCURRENCY
-  };
-}
-
-app.get("/", (req, res) => res.json(healthPayload()));
-app.get("/status", (req, res) => res.json(healthPayload()));
-
-app.post("/scan/start", async (req, res) => {
-  try {
-    assertReady();
-    const state = await loadScanState();
-    const patch = {
-      running: true,
-      done: false,
-      lastError: "",
-      startedAt: state.startedAt || new Date().toISOString()
-    };
-
-    if (req.body?.restart === true) {
-      patch.total = 0;
-      patch.pages = 0;
-      patch.nextPageToken = "";
-      patch.startedAt = new Date().toISOString();
-    }
-
-    await saveScanState(patch);
-    runScanLoop();
-    res.json({ ok: true, message: "scan_started", currentTotal: state.total || 0 });
-  } catch (error) {
-    try { await saveScanState({ lastError: error.message || String(error), running: false }); } catch {}
-    res.status(500).json({ ok: false, error: error.message || String(error) });
-  }
-});
-
-app.post("/scan/pause", async (req, res) => {
-  try {
-    assertReady();
-    await saveScanState({ running: false });
-    res.json({ ok: true, message: "scan_pause_requested" });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message || String(error) });
-  }
-});
-
-app.post("/scan/reset", async (req, res) => {
-  try {
-    assertReady();
-    await saveScanState({
-      total: 0,
-      pages: 0,
-      nextPageToken: "",
-      running: false,
-      done: false,
-      livePageProgress: 0,
-      lastError: "",
-      startedAt: new Date().toISOString()
-    });
-    res.json({ ok: true, message: "scan_reset" });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message || String(error) });
-  }
-});
-
-app.post("/scan/tick", async (req, res) => {
-  try {
-    const result = await processScanCycle();
-    res.json({ ok: true, ...result });
-  } catch (error) {
-    try { await saveScanState({ lastError: error.message || String(error), running: false }); } catch {}
-    res.status(500).json({ ok: false, error: error.message || String(error) });
-  }
-});
-
-app.post("/run-once", async (req, res) => {
-  try {
-    const result = await processCleanupQueueOnce();
-    res.json({ ok: true, ...result });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message || String(error) });
-  }
-});
-
-async function runScanLoop() {
-  if (scanActive) return;
-  scanActive = true;
-  try {
-    while (true) {
-      const state = await loadScanState();
-      if (!state.running || state.done) break;
-      const result = await processScanCycle();
-      console.log("Scan cycle:", result);
-      if (!result.scanned) break;
-    }
-  } catch (error) {
-    console.error("Scan loop error:", error.message || error);
-    try { await saveScanState({ lastError: error.message || String(error), running: false }); } catch {}
-  } finally {
-    scanActive = false;
-  }
-}
-
-async function runCleanupLoop() {
-  if (cleanupActive) return;
-  cleanupActive = true;
-  try {
-    const result = await processCleanupQueueOnce();
-    if (result.processed || result.skippedSafe) console.log("Cleanup cycle:", result);
-  } catch (error) {
-    console.error("Cleanup loop error:", error.message || error);
-  } finally {
-    cleanupActive = false;
-  }
-}
-
-app.listen(PORT, () => {
-  console.log(`CleanSlate FAST worker listening on ${PORT}`);
-});
-
-setInterval(async () => {
-  try {
-    if (!hasFirebase() || !hasGoogleOAuth() || !hasUser()) return;
-    const state = await loadScanState();
-    if (state.running && !state.done) runScanLoop();
-    runCleanupLoop();
-  } catch (error) {
-    console.error("Background interval error:", error.message || error);
-    try { await saveScanState({ lastError: error.message || String(error), running: false }); } catch {}
-  }
-}, POLL_MS);
+if(!admin.apps.length){const raw=process.env.FIREBASE_SERVICE_ACCOUNT_JSON;if(!raw)console.error("Missing FIREBASE_SERVICE_ACCOUNT_JSON");else{try{const sa=JSON.parse(raw);admin.initializeApp({credential:admin.credential.cert(sa),projectId:PROJECT_ID});console.log("Firebase Admin initialized");}catch(e){console.error("Firebase Admin initialization failed:",e.message||e);}}}
+const hasFirebase=()=>admin.apps.length>0, hasGoogleClient=()=>Boolean(GOOGLE_CLIENT_ID&&GOOGLE_CLIENT_SECRET), hasUser=()=>Boolean(CLEANSLATE_USER_ID), db=()=>admin.firestore();
+const userDoc=()=>db().collection("users").doc(CLEANSLATE_USER_ID), stateRef=()=>userDoc().collection("state").doc("scan"), oauthRef=()=>userDoc().collection("secrets").doc("gmailOAuth");
+async function getStoredRefreshToken(){if(!hasFirebase()||!hasUser())return"";const s=await oauthRef().get();return s.exists?(s.data().refreshToken||""):"";}
+async function saveScanState(patch){await stateRef().set({...patch,updatedAt:new Date().toISOString()},{merge:true});}
+async function loadScanState(){const s=await stateRef().get();if(!s.exists){const i={total:0,pages:0,nextPageToken:"",running:false,done:false,lastError:""};await saveScanState(i);return i;}return s.data()||{};}
+function assertReadyForFirebase(){if(!hasFirebase())throw new Error("Firebase Admin is not initialized.");if(!hasUser())throw new Error("Missing CLEANSLATE_USER_ID.");}
+async function assertReadyForGmail(){assertReadyForFirebase();if(!hasGoogleClient())throw new Error("Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET.");if(!(await getStoredRefreshToken()))throw new Error("Gmail is not connected to Render yet. Use the Connect Gmail To Render Worker button.");}
+function oauthClient(refreshToken=""){const c=new google.auth.OAuth2(GOOGLE_CLIENT_ID,GOOGLE_CLIENT_SECRET,`${WORKER_URL}/oauth/callback`);if(refreshToken)c.setCredentials({refresh_token:refreshToken});return c;}
+async function gmailClient(){return google.gmail({version:"v1",auth:oauthClient(await getStoredRefreshToken())});}
+const header=(hs,n)=>(hs||[]).find(h=>(h.name||"").toLowerCase()===n.toLowerCase())?.value||"";
+function parseFrom(v){const input=v||"",m=input.match(/"?([^"<]+)"?\s*<([^>]+)>/);if(m)return{name:m[1].trim().replace(/^"|"$/g,""),email:m[2].trim().toLowerCase()};const email=(input.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)||[""])[0].toLowerCase();return{name:email?email.split("@")[0]:input||"Unknown",email:email||input.toLowerCase()};}
+const domainOf=e=>String(e||"").split("@").pop().toLowerCase().replace(/^www\./,""), cleanKey=v=>String(v||"unknown").toLowerCase().replace(/[.#$/\[\]]/g,"_").slice(0,180);
+function extractUnsubscribe(hs){const raw=header(hs,"List-Unsubscribe"),oneClick=Boolean(header(hs,"List-Unsubscribe-Post")),br=[...String(raw||"").matchAll(/<([^>]+)>/g)].map(m=>m[1]),sp=String(raw||"").split(",").map(x=>x.trim()),urls=[...br,...sp].filter(Boolean);return{unsubUrl:urls.find(u=>/^https?:\/\//i.test(u)&&!/example\.com/i.test(u))||"",unsubMailto:urls.find(u=>/^mailto:/i.test(u))||"",oneClick};}
+const protectedWords=["bank","credit","capital one","fidelity","mortgage","loan","insurance","geico","progressive","doctor","medical","hospital","mychart","pharmacy","irs","tax","payroll","w2","receipt","order","invoice","payment","statement","bill","utility","honda","acura","regal","google","apple","amazon","walmart","netflix","school","daycare","paypal","zelle","wallet"];
+function classifySender(s){const t=`${s.name} ${s.email} ${s.domain}`.toLowerCase();if(protectedWords.some(w=>t.includes(w)))return"safe";if(s.unsubUrl||s.unsubMailto)return"cleanup";return"review";}
+async function mapConcurrent(items,limit,fn){let i=0;await Promise.all(Array.from({length:Math.min(limit,items.length)},async()=>{while(i<items.length){const idx=i++;await fn(items[idx],idx);}}));}
+function mergeSender(map,s){const e=map.get(s.key)||{...s,count:0};e.count+=s.count||1;e.name=s.name||e.name;e.email=s.email||e.email;e.domain=s.domain||e.domain;e.unsubUrl=e.unsubUrl||s.unsubUrl||"";e.unsubMailto=e.unsubMailto||s.unsubMailto||"";e.oneClick=e.oneClick||s.oneClick||false;e.bucket=classifySender(e);map.set(s.key,e);}
+async function batchUpsertSenders(map){const entries=[...map.values()];for(let i=0;i<entries.length;i+=400){const b=db().batch();entries.slice(i,i+400).forEach(s=>b.set(userDoc().collection("senders").doc(s.key),{...s,updatedAt:new Date().toISOString()},{merge:true}));await b.commit();}}
+async function processOneScanPage(gmail,state){const list=await gmail.users.messages.list({userId:"me",maxResults:SCAN_PAGE_SIZE,pageToken:state.nextPageToken||undefined});const messages=list.data.messages||[];if(!messages.length){await saveScanState({running:false,done:true,lastError:""});return{scanned:0,done:true};}const map=new Map();let doneCount=0;await mapConcurrent(messages,SCAN_MESSAGE_CONCURRENCY,async m=>{try{const msg=await gmail.users.messages.get({userId:"me",id:m.id,format:"metadata",metadataHeaders:["From","List-Unsubscribe","List-Unsubscribe-Post"]});const hs=msg.data.payload?.headers||[],from=header(hs,"From");if(!from)return;const p=parseFrom(from),domain=domainOf(p.email||p.name),unsub=extractUnsubscribe(hs),key=cleanKey(p.email||domain||p.name);mergeSender(map,{key,name:p.name,email:p.email,domain,count:1,...unsub});}catch(e){console.error("Message scan failed:",e.message||e);}finally{doneCount++;if(doneCount%100===0)await saveScanState({livePageProgress:doneCount,running:true,lastError:""});}});await batchUpsertSenders(map);const total=Number(state.total||0)+messages.length,pages=Number(state.pages||0)+1,nextPageToken=list.data.nextPageToken||"",done=!nextPageToken;await saveScanState({total,pages,nextPageToken,running:!done,done,livePageProgress:0,lastPageScanned:messages.length,lastSenderGroupsWritten:map.size,lastError:""});return{scanned:messages.length,senderGroups:map.size,done};}
+async function processScanCycle(){await assertReadyForGmail();const gmail=await gmailClient();let scanned=0,groups=0;for(let p=0;p<MAX_SCAN_PAGES_PER_CYCLE;p++){const s=await loadScanState();if(!s.running||s.done)return{scanned,senderGroups:groups,reason:"not_running_or_done"};const r=await processOneScanPage(gmail,s);scanned+=r.scanned||0;groups+=r.senderGroups||0;if(r.done||!r.scanned)break;}return{scanned,senderGroups:groups};}
+function senderQuery(j){if(j.email)return`from:${j.email}`;if(j.domain)return`from:${j.domain}`;return"";}
+async function listAllMessageIds(gmail,q,limit=MAX_MESSAGES_PER_SENDER){const ids=[];let pageToken;while(ids.length<limit){const r=await gmail.users.messages.list({userId:"me",maxResults:500,q,pageToken});for(const m of r.data.messages||[]){ids.push(m.id);if(ids.length>=limit)break;}pageToken=r.data.nextPageToken;if(!pageToken)break;}return ids;}
+async function batchModify(gmail,ids,addLabelIds=[],removeLabelIds=[]){for(let i=0;i<ids.length;i+=1000)await gmail.users.messages.batchModify({userId:"me",requestBody:{ids:ids.slice(i,i+1000),addLabelIds,removeLabelIds}});}
+async function processCleanupQueueOnce(){await assertReadyForGmail();const gmail=await gmailClient();const q=await userDoc().collection("cleanupQueue").where("status","in",["queued","retry"]).limit(MAX_JOBS_PER_CYCLE).get();let processed=0,skippedSafe=0;for(const d of q.docs){const job=d.data();if(job.bucket==="safe"||job.protected){await d.ref.set({status:"skipped_safe",workerStatus:"skipped_safe",updatedAt:new Date().toISOString()},{merge:true});skippedSafe++;continue;}const query=senderQuery(job);if(!query)continue;await d.ref.set({status:"processing",workerStatus:"processing",updatedAt:new Date().toISOString()},{merge:true});const ids=await listAllMessageIds(gmail,query);if(ids.length)await batchModify(gmail,ids,["TRASH"],[]);await d.ref.set({status:"complete",workerStatus:"complete",deleteCount:ids.length,updatedAt:new Date().toISOString()},{merge:true});processed++;}return{processed,skippedSafe};}
+async function healthPayload(){let hasStoredGmailToken=false;try{hasStoredGmailToken=Boolean(await getStoredRefreshToken());}catch{}return{ok:true,service:"CleanSlate Render OAuth Worker",projectId:PROJECT_ID,hasFirebase:hasFirebase(),hasGoogleClient:hasGoogleClient(),hasStoredGmailToken,hasUser:hasUser(),scanActive,cleanupActive,pollMs:POLL_MS,scanPageSize:SCAN_PAGE_SIZE,maxScanPagesPerCycle:MAX_SCAN_PAGES_PER_CYCLE,scanMessageConcurrency:SCAN_MESSAGE_CONCURRENCY,oauthCallback:`${WORKER_URL}/oauth/callback`};}
+app.get("/",async(req,res)=>res.json(await healthPayload()));app.get("/status",async(req,res)=>res.json(await healthPayload()));
+app.get("/oauth/start",async(req,res)=>{try{assertReadyForFirebase();if(!hasGoogleClient())throw new Error("Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET.");const uid=String(req.query.uid||CLEANSLATE_USER_ID),returnUrl=String(req.query.returnUrl||"https://mchlhall5-design.github.io/cleanslate/"),state=Buffer.from(JSON.stringify({uid,returnUrl})).toString("base64url");const url=oauthClient().generateAuthUrl({access_type:"offline",prompt:"consent",scope:["https://www.googleapis.com/auth/gmail.readonly","https://www.googleapis.com/auth/gmail.modify","https://www.googleapis.com/auth/gmail.send"],state});res.redirect(url);}catch(e){res.status(500).send(`<pre>OAuth start failed:\n${e.message||e}</pre>`);}});
+app.get("/oauth/callback",async(req,res)=>{try{assertReadyForFirebase();if(!req.query.code)throw new Error("Missing authorization code.");let state={};try{state=JSON.parse(Buffer.from(String(req.query.state||""),"base64url").toString("utf8"));}catch{}const {tokens}=await oauthClient().getToken(String(req.query.code));if(!tokens.refresh_token)throw new Error("Google did not return a refresh token. Try Connect Gmail again and approve consent.");await oauthRef().set({refreshToken:tokens.refresh_token,scope:tokens.scope||"",connectedAt:new Date().toISOString(),connectedUid:state.uid||CLEANSLATE_USER_ID},{merge:true});await saveScanState({lastError:"",gmailConnectedAt:new Date().toISOString()});const returnUrl=state.returnUrl||"https://mchlhall5-design.github.io/cleanslate/";res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>CleanSlate Connected</title></head><body style="font-family:Arial;padding:24px;background:#07111f;color:#fff"><h2>Gmail connected to Render successfully.</h2><p>You can return to CleanSlate and start the background scan.</p><p><a style="color:#67e8f9;font-size:20px" href="${returnUrl}">Return to CleanSlate</a></p></body></html>`);}catch(e){await saveScanState({lastError:e.message||String(e),running:false}).catch(()=>{});res.status(500).send(`<pre>OAuth callback failed:\n${e.message||e}</pre>`);}});
+app.post("/scan/start",async(req,res)=>{try{await assertReadyForGmail();const s=await loadScanState();const patch={running:true,done:false,lastError:"",startedAt:s.startedAt||new Date().toISOString()};if(req.body?.restart===true){patch.total=0;patch.pages=0;patch.nextPageToken="";patch.startedAt=new Date().toISOString();}await saveScanState(patch);runScanLoop();res.json({ok:true,message:"scan_started",currentTotal:s.total||0});}catch(e){await saveScanState({lastError:e.message||String(e),running:false}).catch(()=>{});res.status(500).json({ok:false,error:e.message||String(e)});}});
+app.post("/scan/pause",async(req,res)=>{try{assertReadyForFirebase();await saveScanState({running:false});res.json({ok:true,message:"scan_pause_requested"});}catch(e){res.status(500).json({ok:false,error:e.message||String(e)});}});
+app.post("/scan/reset",async(req,res)=>{try{assertReadyForFirebase();await saveScanState({total:0,pages:0,nextPageToken:"",running:false,done:false,livePageProgress:0,lastError:"",startedAt:new Date().toISOString()});res.json({ok:true,message:"scan_reset"});}catch(e){res.status(500).json({ok:false,error:e.message||String(e)});}});
+app.post("/run-once",async(req,res)=>{try{res.json({ok:true,...await processCleanupQueueOnce()});}catch(e){res.status(500).json({ok:false,error:e.message||String(e)});}});
+async function runScanLoop(){if(scanActive)return;scanActive=true;try{while(true){const s=await loadScanState();if(!s.running||s.done)break;const r=await processScanCycle();console.log("Scan cycle:",r);if(!r.scanned)break;}}catch(e){console.error("Scan loop error:",e.message||e);await saveScanState({lastError:e.message||String(e),running:false}).catch(()=>{});}finally{scanActive=false;}}
+async function runCleanupLoop(){if(cleanupActive)return;cleanupActive=true;try{const r=await processCleanupQueueOnce();if(r.processed||r.skippedSafe)console.log("Cleanup cycle:",r);}catch(e){console.error("Cleanup loop error:",e.message||e);}finally{cleanupActive=false;}}
+app.listen(PORT,()=>console.log(`CleanSlate Render OAuth worker listening on ${PORT}`));
+setInterval(async()=>{try{if(!hasFirebase()||!hasGoogleClient()||!hasUser())return;const s=await loadScanState();if(s.running&&!s.done)runScanLoop();if(await getStoredRefreshToken())runCleanupLoop();}catch(e){console.error("Background interval error:",e.message||e);await saveScanState({lastError:e.message||String(e),running:false}).catch(()=>{});}},POLL_MS);
