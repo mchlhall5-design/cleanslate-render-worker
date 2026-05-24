@@ -49,6 +49,8 @@ const hasFirebase=()=>admin.apps.length>0;
 const hasGoogleClient=()=>Boolean(GOOGLE_CLIENT_ID&&GOOGLE_CLIENT_SECRET);
 const hasUser=()=>Boolean(CLEANSLATE_USER_ID);
 const db=()=>admin.firestore();
+const FieldValue=admin.firestore.FieldValue;
+const FieldPath=admin.firestore.FieldPath;
 const userDoc=()=>db().collection("users").doc(CLEANSLATE_USER_ID);
 const stateRef=()=>userDoc().collection("state").doc("scan");
 const oauthRef=()=>userDoc().collection("secrets").doc("gmailOAuth");
@@ -147,14 +149,27 @@ function extractUnsubscribe(hs){
   };
 }
 
-const protectedWords=["bank","credit","capital one","fidelity","mortgage","loan","insurance","geico","progressive","doctor","medical","hospital","mychart","pharmacy","irs","tax","payroll","w2","receipt","order","invoice","payment","statement","bill","utility","honda","acura","regal","google","apple","amazon","walmart","netflix","school","daycare","paypal","zelle","wallet"];
-
-function classifySender(s){
-  const t=`${s.name} ${s.email} ${s.domain}`.toLowerCase();
-  if(protectedWords.some(w=>t.includes(w))) return "safe";
-  if(s.unsubUrl||s.unsubMailto) return "cleanup";
-  return "review";
+const protectedWords=["bank","credit","capital one","fidelity","mortgage","loan","insurance","geico","progressive","doctor","medical","hospital","mychart","pharmacy","irs","tax","payroll","w2","statement","bill","utility","honda","acura","regal","school","daycare","paypal","zelle","wallet"];
+const cleanupWords=["promo","deal","sale","coupon","newsletter","marketing","offers","discount","shop","store","rewards","daily","weekly","digest","notification","notify","no-reply","noreply","donotreply","do-not-reply","mailer","campaign","updates"];
+function scoreSender(s){
+  const t=`${s.name||""} ${s.email||""} ${s.domain||""} ${s.subjectSample||""} ${s.listId||""}`.toLowerCase();
+  if(protectedWords.some(w=>t.includes(w))) return {bucket:"safe",confidence:"protected",cleanupScore:0,scoreReasons:["protected keyword"]};
+  let score=0,reasons=[];
+  if(s.unsubUrl||s.unsubMailto){score+=35;reasons.push("unsubscribe available");}
+  if(s.oneClick){score+=20;reasons.push("one-click unsubscribe");}
+  if(s.listId){score+=25;reasons.push("mailing list");}
+  if(s.bulkHeader){score+=20;reasons.push("bulk/list mail");}
+  if(s.noreply){score+=15;reasons.push("no-reply sender");}
+  if(Number(s.promoCount||0)>0){score+=25;reasons.push("promotions label");}
+  if(Number(s.count||0)>=25){score+=10;reasons.push("repeated sender");}
+  if(Number(s.count||0)>=100){score+=15;reasons.push("high volume");}
+  if(Number(s.count||0)>=500){score+=20;reasons.push("very high volume");}
+  if(cleanupWords.some(w=>t.includes(w))){score+=12;reasons.push("marketing keyword");}
+  let bucket="review",confidence="low";
+  if(score>=70){bucket="cleanup";confidence="high";} else if(score>=40){bucket="cleanup";confidence="medium";}
+  return {bucket,confidence,cleanupScore:score,scoreReasons:[...new Set(reasons)].slice(0,8)};
 }
+function classifySender(s){return scoreSender(s).bucket;}
 
 function mergeSender(map,s){
   const e=map.get(s.key)||{...s,count:0};
@@ -165,7 +180,12 @@ function mergeSender(map,s){
   e.unsubUrl=e.unsubUrl||s.unsubUrl||"";
   e.unsubMailto=e.unsubMailto||s.unsubMailto||"";
   e.oneClick=e.oneClick||s.oneClick||false;
-  e.bucket=classifySender(e);
+  e.subjectSample=e.subjectSample||s.subjectSample||"";
+  e.listId=e.listId||s.listId||"";
+  e.bulkHeader=e.bulkHeader||s.bulkHeader||false;
+  e.noreply=e.noreply||s.noreply||false;
+  e.promoCount=(e.promoCount||0)+(s.promoCount||0);
+  const scored=scoreSender(e); Object.assign(e,scored);
   map.set(s.key,e);
 }
 
@@ -173,7 +193,7 @@ async function batchUpsertSenders(map){
   const entries=[...map.values()];
   for(let i=0;i<entries.length;i+=400){
     const b=db().batch();
-    entries.slice(i,i+400).forEach(s=>b.set(userDoc().collection("senders").doc(s.key),{...s,updatedAt:new Date().toISOString()},{merge:true}));
+    entries.slice(i,i+400).forEach(s=>b.set(userDoc().collection("senders").doc(s.key),{key:s.key,name:s.name||"",email:s.email||"",domain:s.domain||"",subjectSample:s.subjectSample||"",listId:s.listId||"",unsubUrl:s.unsubUrl||"",unsubMailto:s.unsubMailto||"",oneClick:Boolean(s.oneClick),bulkHeader:Boolean(s.bulkHeader),noreply:Boolean(s.noreply),count:FieldValue.increment(Number(s.count||0)),promoCount:FieldValue.increment(Number(s.promoCount||0)),cleanupScore:s.cleanupScore||0,bucket:s.bucket||"review",confidence:s.confidence||"low",scoreReasons:s.scoreReasons||[],updatedAt:new Date().toISOString()},{merge:true}));
     await b.commit();
   }
 }
@@ -213,14 +233,17 @@ async function processOneScanPage(gmail,state){
           userId:"me",
           id:m.id,
           format:"metadata",
-          metadataHeaders:["From","List-Unsubscribe","List-Unsubscribe-Post"]
+          metadataHeaders:["From","Subject","List-Unsubscribe","List-Unsubscribe-Post","List-ID","Precedence","Auto-Submitted","Reply-To","Sender"]
         }),"message metadata");
 
         const hs=full.data.payload?.headers||[];
         const from=header(hs,"From");
         if(from){
           const p=parseFrom(from),domain=domainOf(p.email||p.name),unsub=extractUnsubscribe(hs),key=cleanKey(p.email||domain||p.name);
-          mergeSender(senderMap,{key,name:p.name,email:p.email,domain,count:1,...unsub});
+          const labels=full.data.labelIds||[];
+          const subject=header(hs,"Subject"), listId=header(hs,"List-ID"), precedence=header(hs,"Precedence"), autoSub=header(hs,"Auto-Submitted"), replyTo=header(hs,"Reply-To"), senderHeader=header(hs,"Sender");
+          const lower=`${p.email} ${from} ${replyTo} ${senderHeader}`.toLowerCase();
+          mergeSender(senderMap,{key,name:p.name,email:p.email,domain,count:1,subjectSample:subject,listId,bulkHeader:Boolean(listId||/bulk|list|junk/i.test(precedence)||/auto/i.test(autoSub)),noreply:/no-?reply|donotreply|do-not-reply|noreply/i.test(lower),promoCount:labels.includes("CATEGORY_PROMOTIONS")?1:0,...unsub});
         }
       }catch(e){
         if(isRateLimit(e)) throw e;
@@ -296,28 +319,49 @@ async function batchModify(gmail,ids,addLabelIds=[],removeLabelIds=[]){
   }
 }
 
+function parseMailto(mailto){const clean=String(mailto||"").replace(/^mailto:/i,"");const [addr,qs]=clean.split("?");const params=new URLSearchParams(qs||"");return {to:decodeURIComponent(addr||""),subject:params.get("subject")||"Unsubscribe",body:params.get("body")||"Please unsubscribe me from this mailing list."};}
+function toBase64Url(str){return Buffer.from(str).toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"");}
+async function sendMailtoUnsubscribe(gmail,mailto){const m=parseMailto(mailto);if(!m.to)return {ok:false,status:"missing_mailto"};const raw=[`To: ${m.to}`,`Subject: ${m.subject}`,"",m.body].join("\r\n");await gmail.users.messages.send({userId:"me",requestBody:{raw:toBase64Url(raw)}});return {ok:true,status:"mailto_sent"};}
+async function attemptUrlUnsubscribe(url,oneClick){if(!url)return {ok:false,status:"missing_url"};try{const res=await fetch(url,oneClick?{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded","User-Agent":"CleanSlate"},body:"List-Unsubscribe=One-Click"}:{method:"GET",headers:{"User-Agent":"CleanSlate"}});return {ok:res.ok,status:res.ok?"url_submitted":"url_http_error",httpStatus:res.status};}catch(e){return {ok:false,status:"url_failed",error:e.message||String(e)};}}
+async function unsubscribeSender(gmail,job){if(job.unsubUrl)return attemptUrlUnsubscribe(job.unsubUrl,Boolean(job.oneClick));if(job.unsubMailto)return sendMailtoUnsubscribe(gmail,job.unsubMailto);return {ok:false,status:"no_unsubscribe_method"};}
+
 async function processCleanupQueueOnce(){
   await assertReadyForGmail();
   const gmail=await gmailClient();
   const q=await userDoc().collection("cleanupQueue").where("status","in",["queued","retry"]).limit(MAX_JOBS_PER_CYCLE).get();
-  let processed=0,skippedSafe=0;
-
+  let processed=0,skippedSafe=0,trashCount=0,archiveCount=0,unsubscribeAttempts=0;
   for(const d of q.docs){
     const job=d.data();
-    if(job.bucket==="safe"||job.protected){
-      await d.ref.set({status:"skipped_safe",workerStatus:"skipped_safe",updatedAt:new Date().toISOString()},{merge:true});
-      skippedSafe++; continue;
-    }
+    if(job.bucket==="safe"||job.protected){await d.ref.set({status:"skipped_safe",workerStatus:"skipped_safe",updatedAt:new Date().toISOString()},{merge:true});skippedSafe++;continue;}
+    const action=job.action||"unsubscribe_and_trash";
     const query=senderQuery(job);
-    if(!query) continue;
     await d.ref.set({status:"processing",workerStatus:"processing",updatedAt:new Date().toISOString()},{merge:true});
-    const ids=await listAllMessageIds(gmail,query);
-    if(ids.length) await batchModify(gmail,ids,["TRASH"],[]);
-    await d.ref.set({status:"complete",workerStatus:"complete",deleteCount:ids.length,updatedAt:new Date().toISOString()},{merge:true});
-    await userDoc().collection("cleanupHistory").doc(d.id).set({...job,deleteCount:ids.length,processedAt:new Date().toISOString()},{merge:true});
+    let unsubResult={status:"not_requested"};
+    if(action.includes("unsubscribe")){unsubscribeAttempts++;unsubResult=await unsubscribeSender(gmail,job);}
+    let ids=[],changed=0;
+    if(query&&(action.includes("trash")||action.includes("delete")||action.includes("archive"))){ids=await listAllMessageIds(gmail,query);if(ids.length&&(action.includes("trash")||action.includes("delete"))){await batchModify(gmail,ids,["TRASH"],[]);trashCount+=ids.length;changed=ids.length;}else if(ids.length&&action.includes("archive")){await batchModify(gmail,ids,[],["INBOX"]);archiveCount+=ids.length;changed=ids.length;}}
+    await d.ref.set({status:"complete",workerStatus:"complete",unsubscribeResult:unsubResult,affectedCount:changed,updatedAt:new Date().toISOString()},{merge:true});
+    await userDoc().collection("cleanupHistory").doc(d.id).set({...job,unsubscribeResult:unsubResult,affectedCount:changed,processedAt:new Date().toISOString()},{merge:true});
     processed++;
   }
-  return {processed,skippedSafe};
+  return {processed,skippedSafe,trashCount,archiveCount,unsubscribeAttempts};
+}
+
+async function reclassifySenders(){
+  assertReadyForFirebase();
+  let last=null,updated=0,cleanup=0,safe=0,review=0;
+  while(true){
+    let q=userDoc().collection("senders").orderBy(FieldPath.documentId()).limit(400);
+    if(last) q=q.startAfter(last);
+    const snap=await q.get();
+    if(snap.empty) break;
+    const b=db().batch();
+    snap.docs.forEach(doc=>{const s=doc.data();const scored=scoreSender(s);if(scored.bucket==="cleanup")cleanup++;else if(scored.bucket==="safe")safe++;else review++;b.set(doc.ref,{...scored,updatedAt:new Date().toISOString()},{merge:true});updated++;});
+    await b.commit();
+    last=snap.docs[snap.docs.length-1];
+    if(snap.size<400) break;
+  }
+  return {updated,cleanup,safe,review};
 }
 
 async function healthPayload(){
@@ -343,6 +387,11 @@ app.post("/scan/speed",async(req,res)=>{
     await saveScanState({speedMode:mode,lastError:`Speed changed to ${mode}.`});
     res.json({ok:true,speedMode:mode,settings:SPEEDS[mode]});
   }catch(e){res.status(500).json({ok:false,error:e.message||String(e)});}
+});
+
+app.post("/tools/reclassify",async(req,res)=>{
+  try{res.json({ok:true,...await reclassifySenders()});}
+  catch(e){res.status(500).json({ok:false,error:e.message||String(e)});}
 });
 
 app.get("/oauth/start",async(req,res)=>{
